@@ -36,7 +36,9 @@ Requires Python 3.10+ and the official MCP Python SDK 2.3 or later.
 python -m venv .venv
 .venv/Scripts/activate        # Windows; on macOS/Linux: source .venv/bin/activate
 pip install -e ".[dev]"
-pytest
+pytest 
+
+.venv\Scripts\python demo\live_demo.py  #for in class demo
 ```
 
 ## CLI walkthrough
