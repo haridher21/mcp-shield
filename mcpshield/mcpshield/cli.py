@@ -19,6 +19,7 @@ from typing import Any
 
 import anyio
 
+from .diff import escape_text
 from .shield import Shield
 from .store import Store
 
@@ -57,7 +58,7 @@ def cmd_scan(shield: Shield, args) -> int:
     print(f"server '{shield.server_id}': {len(tools)} tool(s), manifest {report.manifest_hash[:16]}")
     for s in report.statuses:
         sev = f"  [{s.severity}]" if s.state != "approved" else ""
-        print(f"  {STATE_LABEL.get(s.state, s.state)}  {s.name:<24} {(s.hash or '')[:12]}{sev}")
+        print(f"  {STATE_LABEL.get(s.state, s.state)}  {escape_text(s.name):<24} {(s.hash or '')[:12]}{sev}")
     current = {t["name"]: t for t in tools}
     if report.diff.has_changes:
         print()
@@ -78,7 +79,7 @@ def cmd_pending(shield: Shield, args) -> int:
         print("Nothing in quarantine.")
         return 0
     for item in q.values():
-        print(f"  {item.status:<8} {item.reason:<9} {item.name:<24} {item.hash[:12]}  since {item.first_seen}")
+        print(f"  {item.status:<8} {item.reason:<9} {escape_text(item.name):<24} {item.hash[:12]}  since {item.first_seen}")
     return 0
 
 
@@ -111,12 +112,12 @@ def cmd_approve(shield: Shield, args) -> int:
             print(exc.args[0])
             rc = 1
             continue
-        if not args.yes and not _confirm(f"Approve this definition of '{name}'?"):
+        if not args.yes and not _confirm(f"Approve this definition of '{escape_text(name)}'?"):
             print("  skipped")
             continue
         try:
             h = shield.approve(name, expected_hash=args.hash, note=args.note or "")
-            print(f"  approved '{name}' ({h[:12]})")
+            print(f"  approved '{escape_text(name)}' ({h[:12]})")
         except (KeyError, ValueError) as exc:
             print(f"  {exc}")
             rc = 1
@@ -147,7 +148,7 @@ def cmd_status(shield: Shield, args) -> int:
         print("No approved tools.")
     for a in approved.values():
         out = "strict output schema" if a.local_output_schema else "no output schema"
-        print(f"  {a.name:<24} {a.hash[:12]}  approved {a.approved_at} by {a.approved_by}  ({out})")
+        print(f"  {escape_text(a.name):<24} {a.hash[:12]}  approved {a.approved_at} by {a.approved_by}  ({out})")
     q = shield.store.get_quarantined(shield.server_id)
     if q:
         print(f"{len(q)} tool(s) in quarantine; see `mcpshield pending`.")
@@ -161,10 +162,12 @@ def cmd_events(shield: Shield, args) -> int:
             parsed = json.loads(detail)
             if isinstance(parsed, dict) and "diff" in parsed and not args.verbose:
                 parsed = {k: v for k, v in parsed.items() if k != "diff"}
-            detail = json.dumps(parsed, ensure_ascii=False)
+            # Event details can quote the server; ensure_ascii escapes control, bidi and non-ASCII characters.
+            detail = json.dumps(parsed, ensure_ascii=True)
         except ValueError:
-            pass
-        print(f"{e['ts']}  {e['severity']:<6} {e['kind']:<20} {e['tool'] or '-':<16} {detail[:200]}")
+            detail = escape_text(detail)
+        tool = escape_text(e["tool"]) if e["tool"] else "-"
+        print(f"{e['ts']}  {e['severity']:<6} {e['kind']:<20} {tool:<16} {detail[:200]}")
     return 0
 
 

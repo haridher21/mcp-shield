@@ -228,3 +228,44 @@ def scan_value(value: Any, path: str = "") -> list[Finding]:
     for p, text in iter_strings(value, path):
         findings.extend(scan_text(text, p))
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Outbound credential detection (tool-call arguments)
+# ---------------------------------------------------------------------------
+
+# Well-known credential formats with a distinctive prefix, so false positives stay rare.
+# Every pattern is linear-time (no nested quantifiers), so whole strings are scanned.
+SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("aws-access-key-id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("private-key-block", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")),
+    ("sk-api-key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}")),
+    ("stripe-key", re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}")),
+    ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})")),
+    ("slack-token", re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,}")),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
+]
+
+
+def _redact(secret: str) -> str:
+    return f"{secret[:4]}…[{len(secret)} chars redacted]"
+
+
+def scan_secrets(value: Any, path: str = "") -> list[Finding]:
+    """Find credential-looking strings (values and object keys) in ``value``.
+
+    The excerpt is redacted and a key that matches is replaced by ``<key>`` in the
+    path, so a finding never stores the credential itself.
+    """
+    findings: list[Finding] = []
+    for p, text in iter_strings(value, path):
+        for rule, pattern in SECRET_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                if p.endswith("#key"):
+                    parent = p[: -len("#key")].rpartition("/")[0]
+                    p = f"{parent}/<key>#key" if parent else "<key>#key"
+                findings.append(Finding(p, rule, _redact(match.group(0))))
+                break
+    return findings

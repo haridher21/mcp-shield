@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import anyio
 import mcp.types as types
 from mcp import Client, StdioServerParameters
 from mcp.server.lowlevel import Server
@@ -43,7 +44,8 @@ async def fetch_tools(client: Client) -> list[dict[str, Any]]:
 
 
 def blocked_result(verdict: Verdict, stage: str) -> types.CallToolResult:
-    # Deliberately do NOT echo the offending upstream content back to the model.
+    # Deliberately do NOT echo the offending upstream content back to the model:
+    # result-side reasons are fixed strings and rule names; verdict.details stays in the audit log.
     reasons = "; ".join(verdict.reasons[:5]) or "policy violation"
     if verdict.findings and not verdict.reasons[1:]:
         reasons += " [" + ", ".join(sorted({f.rule for f in verdict.findings})) + "]"
@@ -54,8 +56,13 @@ def blocked_result(verdict: Verdict, stage: str) -> types.CallToolResult:
 
 
 def build_proxy_server(upstream: Client, shield: Shield, name: str = "mcpshield") -> Server:
+    def deadline():
+        # A hung or deliberately slow upstream must not stall the AI application.
+        return anyio.fail_after(shield.policy.upstream_timeout)
+
     async def on_list_tools(ctx, params) -> types.ListToolsResult:
-        tools = await fetch_tools(upstream)
+        with deadline():
+            tools = await fetch_tools(upstream)
         report = shield.sync(tools)
         if report.blocked:
             log.warning("MCPShield is withholding tools: %s", ", ".join(report.blocked))
@@ -67,13 +74,26 @@ def build_proxy_server(upstream: Client, shield: Shield, name: str = "mcpshield"
         args = params.arguments or {}
         current = None
         if shield.policy.recheck_definitions_on_call:
-            current = await fetch_tools(upstream)
+            try:
+                with deadline():
+                    current = await fetch_tools(upstream)
+            except TimeoutError:
+                detail = f"tools/list re-check got no response within {shield.policy.upstream_timeout}s"
+                log.warning("%s (call to '%s')", detail, name_)
+                shield.store.log_event(shield.server_id, "upstream_timeout", "medium", detail, name_)
+                return blocked_result(Verdict.block("could not re-check tool definitions: upstream timed out"), "call")
             shield.sync(current)
         verdict = shield.check_call(name_, args, current)
         if not verdict.allowed:
             return blocked_result(verdict, "call")
         try:
-            result = await upstream.call_tool(name_, args)
+            with deadline():
+                result = await upstream.call_tool(name_, args)
+        except TimeoutError:
+            detail = f"tools/call got no response within {shield.policy.upstream_timeout}s"
+            log.warning("upstream call to '%s' timed out", name_)
+            shield.store.log_event(shield.server_id, "upstream_timeout", "medium", detail, name_)
+            return blocked_result(Verdict.block("upstream call timed out"), "result")
         except Exception as exc:  # upstream/transport failure (incl. SDK-side output checks): fail closed
             detail = f"{type(exc).__name__}: {str(exc)[:300]}"
             log.warning("upstream call to '%s' failed: %s", name_, detail)

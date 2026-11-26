@@ -81,9 +81,13 @@ async def test_extra_output_field_rejected(harness):
     async with harness.connect() as app:
         harness.mode = "extra_field"
         r = await app.call_tool("get_weather", PARIS)
-        assert r.is_error and "instructions" in r.content[0].text
+        assert r.is_error and "output does not match the approved output schema" in r.content[0].text
+        assert "instructions" not in r.content[0].text  # server-chosen property name not echoed
         assert r.structured_content is None
         assert len(harness.upstream_calls) == 1
+        # the full jsonschema explanation is kept for the reviewer in the audit log
+        ev = harness.shield.store.events("weather", kind="result_blocked")[0]
+        assert "'instructions' was unexpected" in ev["detail"]
 
 
 async def test_instruction_text_in_allowed_field_blocked(harness):
@@ -160,6 +164,67 @@ async def test_approve_pins_exact_reviewed_hash(harness):
         await visible(app)
         with pytest.raises(ValueError):
             shield.approve("get_weather", expected_hash="deadbeef")
+
+
+async def test_model_sees_hardened_input_schema(harness):
+    async with harness.connect() as app:
+        (tool,) = (await app.list_tools()).tools
+        schema = tool.input_schema
+        assert schema["additionalProperties"] is False  # what check_call enforces
+        assert schema["properties"]["city"]["maxLength"] == 100
+        assert schema["properties"]["unit"]["maxLength"] == harness.shield.policy.max_string_length
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "AKIAIOSFODNN7EXAMPLE",
+        "sk-ant-api03-abcdefghijklmnopqrstuvwxyz012345",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "ghp_" + "a1B2" * 9,
+    ],
+)
+async def test_secret_in_arguments_blocked_before_transmission(harness, secret):
+    async with harness.connect() as app:
+        r = await app.call_tool("get_weather", {"city": f"Paris {secret}"[:100]})
+        assert r.is_error and "looks like a credential" in r.content[0].text
+        assert secret not in r.content[0].text
+        assert harness.upstream_calls == []
+        ev = harness.shield.store.events("weather", kind="call_blocked")[0]
+        assert ev["severity"] == "high" and secret not in ev["detail"]  # audit log stores a redacted excerpt
+
+
+async def test_upstream_timeout_fails_closed(shield):
+    import copy
+
+    import anyio
+    import mcp.types as types
+    from mcp import Client
+    from mcp.server.lowlevel import Server
+
+    from mcpshield.proxy import build_proxy_server, fetch_tools
+    from weather_server import GET_WEATHER
+
+    tool = copy.deepcopy(GET_WEATHER)
+    del tool["outputSchema"]
+
+    async def on_list_tools(ctx, params):
+        return types.ListToolsResult(tools=[types.Tool.model_validate(tool)])
+
+    async def on_call_tool(ctx, params):
+        await anyio.sleep(30)  # a hung or deliberately slow server
+        return types.CallToolResult(content=[types.TextContent(type="text", text="late")])
+
+    slow = Server("slow", version="1.0.0", on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+    shield.policy.upstream_timeout = 0.2
+    async with Client(slow) as up:
+        shield.sync(await fetch_tools(up))
+        shield.approve("get_weather")
+        async with Client(build_proxy_server(up, shield)) as app:
+            with anyio.fail_after(5):
+                r = await app.call_tool("get_weather", PARIS)
+    assert r.is_error and "timed out" in r.content[0].text
+    assert shield.store.events("weather", kind="upstream_timeout")
 
 
 async def test_approval_from_another_process_applies_live(harness):

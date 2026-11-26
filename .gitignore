@@ -218,3 +218,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MCPShield
+#   SQLite state written at runtime (approvals, quarantine, audit log), e.g.
+#   demo_live.db from demo/live_demo.py and mcpshield.db from the CLI.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Personal reference material, not part of the code base
+submitted_docs/
