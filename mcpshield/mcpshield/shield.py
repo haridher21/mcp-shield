@@ -15,7 +15,16 @@ from typing import Any
 from .canonical import canonical_equal, canonicalize, manifest_hash, tool_hash
 from .diff import ManifestDiff, diff_manifests, diff_tool, render_tool_diff
 from .store import ApprovedTool, Store
-from .validator import Finding, check_schema, compile_schema, harden_schema, scan_text, scan_value, validate
+from .validator import (
+    Finding,
+    check_schema,
+    compile_schema,
+    harden_schema,
+    scan_secrets,
+    scan_text,
+    scan_value,
+    validate,
+)
 
 
 @dataclass
@@ -23,26 +32,36 @@ class Policy:
     max_string_length: int = 1024        # cap applied to every string in approved schemas
     max_array_items: int = 100
     max_text_length: int = 8192          # cap on each unstructured text block in a result
+    max_structured_bytes: int = 65_536   # cap on the JSON size of structuredContent in a result
     block_suspicious_output: bool = True  # False = flag (log) instruction-like output but let it through
     strict_text_mirror: bool = True      # text blocks must mirror validated structuredContent
     allowed_content_types: tuple[str, ...] = ("text",)
     require_output_schema: bool = False  # reject structuredContent for tools without an approved schema
     recheck_definitions_on_call: bool = True
+    block_secrets_in_arguments: bool = True  # block calls whose arguments carry credential-looking strings
+    upstream_timeout: float | None = 30.0   # seconds per upstream request; None = wait forever
 
 
 @dataclass
 class Verdict:
+    """Outcome of a check.
+
+    ``reasons`` may be shown to the model, so on the result side they never contain
+    server-controlled text. ``details`` holds the full explanation for the audit log only.
+    """
+
     allowed: bool
     reasons: list[str] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    details: list[str] = field(default_factory=list)
 
     @classmethod
     def ok(cls) -> "Verdict":
         return cls(True)
 
     @classmethod
-    def block(cls, *reasons: str, findings: list[Finding] | None = None) -> "Verdict":
-        return cls(False, list(reasons), findings or [])
+    def block(cls, *reasons: str, findings: list[Finding] | None = None, details: list[str] | None = None) -> "Verdict":
+        return cls(False, list(reasons), findings or [], details or [])
 
 
 @dataclass
@@ -164,10 +183,21 @@ class Shield:
         return SyncReport(mhash, diff, statuses, dups, newly)
 
     def visible_tools(self, tools: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        """Only tools whose current definition hashes to the approved hash are exposed."""
+        """Only tools whose current definition hashes to the approved hash are exposed.
+
+        Each exposed tool advertises the hardened input schema that ``check_call``
+        enforces, so the model is shown the contract it will actually be held to.
+        """
         current, _ = index_tools(tools)
         approved = self.approved()
-        return [t for n, t in current.items() if n in approved and tool_hash(t) == approved[n].hash]
+        visible = []
+        for n, t in current.items():
+            a = approved.get(n)
+            if a is not None and tool_hash(t) == a.hash:
+                shown = dict(t)
+                shown["inputSchema"] = self._harden(a.definition.get("inputSchema") or {"type": "object"})
+                visible.append(shown)
+        return visible
 
     # ------------------------------------------------------------------ decisions
     def pending_diff(self, name: str) -> str:
@@ -230,7 +260,10 @@ class Shield:
     ) -> Verdict:
         verdict = self._check_call(name, arguments or {}, current_tools)
         if not verdict.allowed:
-            self._event("call_blocked", "medium", {"reasons": verdict.reasons}, name)
+            detail: dict[str, Any] = {"reasons": verdict.reasons}
+            if verdict.findings:  # credential findings carry only redacted excerpts
+                detail["findings"] = [str(f) for f in verdict.findings]
+            self._event("call_blocked", "high" if verdict.findings else "medium", detail, name)
         return verdict
 
     def _check_call(self, name, arguments, current_tools) -> Verdict:
@@ -250,17 +283,20 @@ class Shield:
         errors = validate(self._validator(approved, "input"), dict(arguments))
         if errors:
             return Verdict.block(*(f"invalid argument {e}" for e in errors))
+        if self.policy.block_secrets_in_arguments:
+            secrets = scan_secrets(dict(arguments), "arguments")
+            if secrets:
+                rules = ", ".join(sorted({f.rule for f in secrets}))
+                return Verdict.block(f"arguments contain what looks like a credential ({rules})", findings=secrets)
         return Verdict.ok()
 
     def check_result(self, name: str, result: Mapping[str, Any]) -> Verdict:
         verdict = self._check_result(name, result)
         if not verdict.allowed:
-            self._event(
-                "result_blocked",
-                "high" if verdict.findings else "medium",
-                {"reasons": verdict.reasons, "findings": [str(f) for f in verdict.findings]},
-                name,
-            )
+            detail: dict[str, Any] = {"reasons": verdict.reasons, "findings": [str(f) for f in verdict.findings]}
+            if verdict.details:
+                detail["details"] = verdict.details
+            self._event("result_blocked", "high" if verdict.findings else "medium", detail, name)
         elif verdict.findings:
             self._event("result_flagged", "medium", {"findings": [str(f) for f in verdict.findings]}, name)
         return verdict
@@ -269,17 +305,35 @@ class Shield:
         approved = self.approved().get(name)
         if approved is None:
             return Verdict.block(f"tool '{name}' is not approved")
+        # Reasons are fixed strings (no server text): the proxy may show them to the model.
+        # Anything that quotes the server's result goes into ``details`` for the audit log.
         p = self.policy
         reasons: list[str] = []
+        details: list[str] = []
         structured = result.get("structuredContent")
         schema = approved.local_output_schema
         is_error = bool(result.get("isError"))
+
+        if structured is not None:
+            try:
+                size = len(json.dumps(structured, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            except (TypeError, ValueError):
+                return Verdict.block("structuredContent is not valid JSON")
+            if size > p.max_structured_bytes:
+                # Refuse before validating or scanning, so the work done on a result stays bounded.
+                return Verdict.block(
+                    f"structuredContent exceeds {p.max_structured_bytes} bytes",
+                    details=[f"structuredContent is {size} bytes"],
+                )
 
         if schema is not None and not is_error:
             if structured is None:
                 reasons.append("result has no structuredContent but the approved tool declares an output schema")
             else:
-                reasons += [f"output {e}" for e in validate(self._validator(approved, "output"), structured)]
+                errors = validate(self._validator(approved, "output"), structured)
+                if errors:
+                    reasons.append("output does not match the approved output schema")
+                    details += [f"output {e}" for e in errors]
         elif structured is not None and schema is None and p.require_output_schema:
             reasons.append("structuredContent returned by a tool without an approved output schema")
 
@@ -290,7 +344,8 @@ class Shield:
         for i, block in enumerate(result.get("content") or []):
             btype = block.get("type")
             if btype not in p.allowed_content_types:
-                reasons.append(f"content[{i}] has disallowed type '{btype}'")
+                reasons.append(f"content[{i}] has a disallowed content type")
+                details.append(f"content[{i}] type {str(btype)[:40]!r}")
                 continue
             if btype != "text":
                 continue
@@ -309,7 +364,7 @@ class Shield:
             findings += scan_text(text, f"content[{i}].text")
 
         if reasons:
-            return Verdict.block(*reasons, findings=findings)
+            return Verdict.block(*reasons, findings=findings, details=details)
         if findings and p.block_suspicious_output:
             return Verdict.block("result contains instruction-like content", findings=findings)
         return Verdict(True, [], findings)
